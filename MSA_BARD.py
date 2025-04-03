@@ -1,0 +1,191 @@
+import pandas as pd
+import numpy as np
+import  torch
+from torch.utils.data import Dataset, DataLoader
+import os
+import torch.nn as nn
+import re
+import torch.nn.functional as F
+#from torch.xpu import device
+from torchvision import transforms, utils
+import cv2
+from torch.cuda.amp import GradScaler, autocast
+from PIL import Image
+
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report, confusion_matrix
+
+from transformers import BartTokenizer, BartModel, ViTModel, get_linear_schedule_with_warmup
+
+label_map = {"Positive": 1, "Negative": 2, "Neutral": 0}
+
+
+class MFBFusion(nn.Module):
+    def __init__(self, image_embed_dim, text_embed_dim, fact_dim, output_dim):
+        super(MFBFusion, self).__init__()
+        self.image_embed_dim = image_embed_dim
+        self.text_embed_dim = text_embed_dim
+        self.fact_dim = fact_dim
+        self.output_dim = output_dim
+        self.image_linear = nn.Linear(self.image_embed_dim, self.fact_dim * self.output_dim)
+        self.text_linear = nn.Linear(self.text_embed_dim, self.fact_dim * self.output_dim)
+    def forward(self, text_embeddings, image_embeddings):
+        image_proj = self.image_linear(image_embeddings)
+        text_proj = self.text_linear(text_embeddings)
+        mfb_output = image_proj * text_proj
+        mfb_output = mfb_output.view(-1,self.fact_dim, self.output_dim)
+        mfb_output = mfb_output.mean(dim=1)
+        mfb_output = F.normalize(mfb_output, p=2, dim=1)
+        return mfb_output
+
+
+
+class FocalLoss(torch.nn.Module):
+    def __init__(self, alpha=None, gamma=2, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = torch.nn.functional.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+
+        if self.alpha is not None:
+            targets = targets.long()  # Ensure targets are long tensor for indexing
+            alpha = self.alpha[targets]  # Index alpha using targets
+            alpha = alpha.view(-1, 1)  # Adjust dimensions for broadcasting
+            #print(f"alpha: {alpha.shape}, focal_loss:{focal_loss.shape}")
+
+            focal_loss = alpha * focal_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
+
+
+class CustomTextDataLoader(Dataset):
+    def __init__(self, csv_file):
+        self.data = pd.read_csv(csv_file)
+        self.label = self.data["ReLabel"].tolist()
+        self.sentences = self.data["Text"].tolist()
+        self.image_path = self.data["Image"].tolist()
+        self.samples = len(self.data)
+        self.tokenizer = BartTokenizer.from_pretrained("facebook/bart-large-mnli")
+        self.transform = transforms.Compose([transforms.Resize((224,224)),transforms.ToTensor()])
+        self.image_size = 224
+
+    def __len__(self):
+        return self.samples
+
+    def __getitem__(self, idx):
+        text = self.sentences[idx]
+        image_path = self.image_path[idx]
+        image = Image.open(image_path)
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+            print("Converted to RGB")
+
+        image = self.transform(image)
+        label = self.label[idx]
+        label = label_map[label]
+        encoded_input = self.tokenizer(text, padding='max_length', truncation=True, max_length=30, return_tensors='pt')
+        return {'input_ids': encoded_input['input_ids'].flatten(), 'image': image, 'attention_mask': encoded_input['attention_mask'].flatten(), 'label': torch.tensor(label,dtype=torch.long)}
+
+
+class BART_ViT(torch.nn.Module):
+    def __init__(self, num_labels=3):
+        super(BART_ViT, self).__init__()
+        self.text_embeddings_size = 1024
+        self.num_labels = num_labels
+        self.model_text = BartModel.from_pretrained("facebook/bart-large-mnli", return_dict=True)
+        self.text_embed_dim = 1024
+        self.fact_dim = 16
+        self.output_dim = 1000
+        self.num_labels = num_labels
+        self.linear = torch.nn.Linear(self.text_embed_dim, self.num_labels)
+
+        self.activation = torch.nn.ReLU()
+        self.dropout = torch.nn.Dropout(0.1)
+        self.softmax = torch.nn.Softmax(dim=1)
+    def forward(self, input_ids, attention_mask):
+        text_output = self.model_text(input_ids=input_ids, attention_mask=attention_mask)
+        text_output = text_output.last_hidden_state[:, 0, :]
+        output = self.linear(text_output)
+        output = self.softmax(output)
+        return output
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+def TestTextModel(model):
+    datasets = CustomTextDataLoader("./test.csv")
+    dataloader = DataLoader(datasets, batch_size=32, shuffle=False)
+    temp_model = model #BART_ViT()
+    #temp_model.load_state_dict(torch.load('./Baseline-Models/BART.pth'))
+    temp_model.to(device)
+    temp_model.eval()
+    pred_labels = []
+    actual_labels = []
+    for i, data in enumerate(dataloader):
+        input_ids = data['input_ids'].to(device)
+        attention_mask = data['attention_mask'].to(device)
+        label = data['label'].to(device)
+        output = temp_model(input_ids, attention_mask)
+        _, pred = torch.max(output, 1)
+        pred_labels.extend(pred.cpu().numpy())
+        actual_labels.extend(label.cpu().numpy())
+    acc = accuracy_score(actual_labels, pred_labels)
+    print("Accuracy: ", accuracy_score(actual_labels, pred_labels))
+    print("Precision: ", precision_score(actual_labels, pred_labels, average='macro'))
+    print("Recall: ", recall_score(actual_labels, pred_labels, average='macro'))
+    print("F1 Score: ", f1_score(actual_labels, pred_labels, average='macro'))
+    print("Classification Report: \n", classification_report(actual_labels, pred_labels))
+    print("Confusion Matrix: \n", confusion_matrix(actual_labels, pred_labels))
+    return acc
+
+def TrainTextModel():
+    datasets = CustomTextDataLoader("./train.csv")
+    dataloader = DataLoader(datasets, batch_size=16, shuffle=True)
+    model = BART_ViT()
+    model.to(device)
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-6)
+    epoch = 15
+    total_steps = len(dataloader) * 10
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
+    class_counts = [5713, 4027, 6003]
+    class_weights = 1. / torch.tensor(class_counts, dtype=torch.float)
+    class_weights = class_weights / class_weights.sum()  # Normalize weights
+    class_weights = class_weights.to(device)
+    #loss_fn = FocalLoss(alpha=class_weights, gamma=2, reduction='mean')
+
+    loss_fn = torch.nn.CrossEntropyLoss()
+    globalACC = 0
+    for epoch in range(epoch):
+        total_loss = 0
+        for i, data in enumerate(dataloader):
+            input_ids = data['input_ids'].to(device)
+            attention_mask = data['attention_mask'].to(device)
+            label = data['label'].to(device)
+            optimizer.zero_grad()
+            output = model(input_ids, attention_mask)
+            loss = loss_fn(output, label)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        scheduler.step()
+        print("Epoch: ", epoch, "Loss: ", total_loss)
+        acc = TestTextModel(model)
+        if acc > globalACC:
+            globalACC = acc
+            torch.save(model.state_dict(), './Baseline-Models/BART.pth')
+
+
+if __name__ == "__main__":
+    TrainTextModel()
+    #TestTextModel()

@@ -1,0 +1,14 @@
+torch
+transformers
+torchmetrics
+lightning
+pandas
+numpy
+matplotlib
+tensorboard
+tqdm
+scikit-learn
+seaborn
+git+https://github.com/csebuetnlp/normalizer
+sentencepiece
+ctransformers[cuda]>=0.2.24
