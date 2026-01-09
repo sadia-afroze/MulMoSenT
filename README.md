@@ -10,4 +10,3 @@ cd MulMoSenT
 3. Install dependencies:
 pip install -r requirements.txt
 4. Train Model: python3 MSA_Proposed.py
-5. 
